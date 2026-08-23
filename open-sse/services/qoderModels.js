@@ -269,6 +269,45 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null) {
     });
   }
 
+  // Qoder's model-list endpoint can omit Cantus even though the inference
+  // endpoint accepts the official cmodel key. Keep the live catalog as the
+  // source for every other model, but register a provider-specific fallback
+  // so qd/cmodel can build a request instead of failing before dispatch.
+  if (!rawConfigs.has("cmodel")) {
+    let fallbackConfig = null;
+    for (const entry of body.chat) {
+      if (entry && entry.key && rawConfigs.has(entry.key)) {
+        fallbackConfig = entry;
+        break;
+      }
+    }
+
+    const cmodelConfig = fallbackConfig
+      ? { ...fallbackConfig, key: "cmodel", display_name: "Cantus" }
+      : {
+          key: "cmodel",
+          enable: true,
+          display_name: "Cantus",
+          max_input_tokens: 131072,
+          max_output_tokens: 64000,
+          is_vl: false,
+          is_reasoning: false,
+          description: "Qoder Cantus (C-model)",
+        };
+
+    rawConfigs.set("cmodel", cmodelConfig);
+    const cmodelContext = Number(cmodelConfig.max_input_tokens) || 131072;
+    models.push({
+      id: "cmodel",
+      name: "Cantus",
+      contextLength: cmodelContext,
+      isVL: !!cmodelConfig.is_vl,
+      isReasoning: !!cmodelConfig.is_reasoning,
+      maxOutputTokens: Number(cmodelConfig.max_output_tokens) || 0,
+      description: cmodelConfig.description || "",
+    });
+  }
+
   return { models, rawConfigs };
 }
 

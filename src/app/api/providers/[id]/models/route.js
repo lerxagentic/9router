@@ -10,6 +10,7 @@ import { resolveKimchiModels } from "open-sse/services/kimchiModels.js";
 import { resolveQoderModels } from "open-sse/services/qoderModels.js";
 import { resolveGrokCliModels } from "open-sse/services/grokCliModels.js";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { proxyAwareFetch } from "open-sse/utils/proxyFetch.js";
 import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 
 const GEMINI_CLI_MODELS_URL = "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels";
@@ -86,6 +87,22 @@ const getStaticProviderModels = (providerId) =>
     name: model.name || model.id,
   }));
 
+const getConnectionProxyOptions = async (connection) => {
+  const proxy = await resolveConnectionProxyConfig(connection?.providerSpecificData || {});
+  return {
+    connectionProxyEnabled: proxy.connectionProxyEnabled === true,
+    connectionProxyUrl: proxy.connectionProxyUrl || "",
+    connectionNoProxy: proxy.connectionNoProxy || "",
+    vercelRelayUrl: proxy.vercelRelayUrl || "",
+    strictProxy: proxy.strictProxy === true,
+  };
+};
+
+const fetchWithConnectionProxy = async (connection, url, options = {}) => {
+  const proxyOptions = await getConnectionProxyOptions(connection);
+  return proxyAwareFetch(url, options, proxyOptions);
+};
+
 // Generic custom resolver for OAuth providers that need refresh-on-401 + token persist.
 // Receives a `fetchFn(token)` and returns parsed models or throws.
 const buildOAuthResolver = ({ refreshFn, fetchFn, parseFn, errorLabel }) => async (connection) => {
@@ -114,9 +131,8 @@ const buildOAuthResolver = ({ refreshFn, fetchFn, parseFn, errorLabel }) => asyn
       const models = parseFn(data);
       if (models.length > 0) return { models };
     } else {
-      const errorText = await response.text();
-      warning = `${errorLabel}: ${response.status} ${errorText}`;
-      console.log(`${errorLabel} (falling back to static):`, errorText);
+      warning = `${errorLabel}: ${response.status}`;
+      console.log(`${errorLabel} (falling back to static): status=${response.status}`);
     }
   } catch (error) {
     warning = `${errorLabel}: ${error.message}`;
@@ -147,7 +163,7 @@ const PROVIDER_MODELS_CONFIG = {
   codex: {
     customResolver: buildOAuthResolver({
       refreshFn: (conn) => refreshCodexToken(conn.refreshToken),
-      fetchFn: (token) => fetch(CODEX_MODELS_URL, {
+      fetchFn: (token, conn) => fetchWithConnectionProxy(conn, CODEX_MODELS_URL, {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
@@ -344,7 +360,10 @@ const PROVIDER_MODELS_CONFIG = {
       };
       let warning;
       try {
-        const result = await resolveQoderModels(credentials, { forceRefresh: true });
+        const result = await resolveQoderModels(credentials, {
+          forceRefresh: true,
+          proxyOptions: await getConnectionProxyOptions(connection),
+        });
         if (result?.models?.length) {
           return {
             models: result.models.map((m) => ({
@@ -374,7 +393,7 @@ const PROVIDER_MODELS_CONFIG = {
       fetchFn: (token, conn) => {
         const projectId = conn.projectId || conn.providerSpecificData?.projectId;
         const body = projectId ? { project: projectId } : {};
-        return fetch(GEMINI_CLI_MODELS_URL, {
+        return fetchWithConnectionProxy(conn, GEMINI_CLI_MODELS_URL, {
           method: "POST",
           headers: {
             "Content-Type": "application/json",
@@ -426,8 +445,7 @@ const PROVIDER_MODELS_CONFIG = {
         headers: { "Content-Type": "application/json" }
       });
       if (!response.ok) {
-        const errorText = await response.text();
-        console.log("Error fetching models from ollama-local:", errorText);
+        console.log(`Error fetching models from ollama-local: status=${response.status}`);
         return { error: `Failed to fetch models: ${response.status}`, status: response.status };
       }
       const data = await response.json();
@@ -454,17 +472,17 @@ export async function GET(request, { params }) {
         return NextResponse.json({ error: "No base URL configured for OpenAI compatible provider" }, { status: 400 });
       }
       const url = `${baseUrl.replace(/\/$/, "")}/models`;
-      const response = await fetch(url, {
+      const response = await fetchWithConnectionProxy(connection, url, {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
           "Authorization": `Bearer ${connection.apiKey}`,
         },
+        signal: request.signal,
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        console.log(`Error fetching models from ${connection.provider}:`, errorText);
+        console.log(`Error fetching models from ${connection.provider}: status=${response.status}`);
         return NextResponse.json(
           { error: `Failed to fetch models: ${response.status}` },
           { status: response.status }
@@ -493,7 +511,7 @@ export async function GET(request, { params }) {
       }
 
       const url = `${baseUrl}/models`;
-      const response = await fetch(url, {
+      const response = await fetchWithConnectionProxy(connection, url, {
         method: "GET",
         headers: {
           "Content-Type": "application/json",
@@ -501,11 +519,11 @@ export async function GET(request, { params }) {
           "anthropic-version": "2023-06-01",
           "Authorization": `Bearer ${connection.apiKey}`
         },
+        signal: request.signal,
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        console.log(`Error fetching models from ${connection.provider}:`, errorText);
+        console.log(`Error fetching models from ${connection.provider}: status=${response.status}`);
         return NextResponse.json(
           { error: `Failed to fetch models: ${response.status}` },
           { status: response.status }
@@ -572,11 +590,13 @@ export async function GET(request, { params }) {
       fetchOptions.body = JSON.stringify(config.body);
     }
 
-    const response = await fetch(url, fetchOptions);
+    const response = await fetchWithConnectionProxy(connection, url, {
+      ...fetchOptions,
+      signal: request.signal,
+    });
 
     if (!response.ok) {
-      const errorText = await response.text();
-      console.log(`Error fetching models from ${connection.provider}:`, errorText);
+      console.log(`Error fetching models from ${connection.provider}: status=${response.status}`);
       return NextResponse.json(
         { error: `Failed to fetch models: ${response.status}` },
         { status: response.status }

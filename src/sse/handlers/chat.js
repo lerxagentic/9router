@@ -9,6 +9,7 @@ import {
 } from "../services/auth.js";
 import { handleAntigravityQuotaError, clearAntigravityStrikes } from "../services/antigravityQuota.js";
 import { getSettings } from "@/lib/localDb";
+import { validateApiKeyAccess } from "../services/apiKeyLimits.js";
 import { getModelInfo, getComboModels } from "../services/model.js";
 import { handleChatCore } from "open-sse/handlers/chatCore.js";
 import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
@@ -77,6 +78,15 @@ export async function handleChat(request, clientRawRequest = null) {
     if (!valid) {
       log.warn("AUTH", "Invalid API key (requireApiKey=true)");
       return errorResponse(HTTP_STATUS.UNAUTHORIZED, "Invalid API key");
+    }
+
+    const accessCheck = await validateApiKeyAccess(apiKey, modelStr);
+    if (!accessCheck.allowed) {
+      log.warn("API_KEY", `Access denied: ${accessCheck.error}`);
+      return errorResponse(
+        accessCheck.limitType ? HTTP_STATUS.RATE_LIMITED : HTTP_STATUS.FORBIDDEN,
+        accessCheck.error,
+      );
     }
   }
 

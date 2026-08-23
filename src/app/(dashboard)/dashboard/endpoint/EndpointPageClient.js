@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useCallback } from "react";
 import PropTypes from "prop-types";
-import { Card, Button, Input, Modal, CardSkeleton, Toggle, ConfirmModal } from "@/shared/components";
+import { Card, Button, Input, Modal, CardSkeleton, Toggle, ConfirmModal, ModelSelectModal } from "@/shared/components";
 import { useCopyToClipboard } from "@/shared/hooks/useCopyToClipboard";
 import {
   TUNNEL_BENEFITS,
@@ -25,10 +25,48 @@ export default function APIPageClient({ machineId }) {
   const [createdKey, setCreatedKey] = useState(null);
   const [confirmState, setConfirmState] = useState(null);
 
+  // API key form state (for create/edit)
+  const [showEditModal, setShowEditModal] = useState(false);
+  const [selectedKey, setSelectedKey] = useState(null);
+  const [keyForm, setKeyForm] = useState({
+    name: "",
+    tokenLimit: null,
+    requestLimit: null,
+    resetPeriod: "monthly",
+    customResetDays: null,
+    scopeType: "global",
+    allowedModels: [],
+    allowedCombos: [],
+    allocatedConnectionIds: [],
+  });
+
+  // Model/combo select modals
+  const [showModelSelect, setShowModelSelect] = useState(false);
+  const [showComboSelect, setShowComboSelect] = useState(false);
+  const [activeProviders, setActiveProviders] = useState([]);
+  const [modelAliases, setModelAliases] = useState({});
+  const [combos, setCombos] = useState([]);
+
+  // Connection allocation
+  const [availableConnections, setAvailableConnections] = useState([]);
+  const [showConnectionSelect, setShowConnectionSelect] = useState(false);
+  const [connectionSearchQuery, setConnectionSearchQuery] = useState("");
+  const [expandedProviders, setExpandedProviders] = useState(new Set());
+
   const [requireApiKey, setRequireApiKey] = useState(false);
   const [requireLogin, setRequireLogin] = useState(true);
   const [hasPassword, setHasPassword] = useState(true);
  const [tunnelDashboardAccess, setTunnelDashboardAccess] = useState(false);
+
+ // Token Auto-Refresh state
+  const [tokenAutoRefreshEnabled, setTokenAutoRefreshEnabled] = useState(false);
+  const [tokenAutoRefreshLastRunAt, setTokenAutoRefreshLastRunAt] = useState(null);
+  const [tokenAutoRefreshStats, setTokenAutoRefreshStats] = useState({
+    accountsChecked: 0,
+    accountsRefreshed: 0,
+    successCount: 0,
+    failureCount: 0,
+  });
 
  // Cloudflare Tunnel state
   const [tunnelChecking, setTunnelChecking] = useState(true);
@@ -76,6 +114,9 @@ export default function APIPageClient({ machineId }) {
 
   // API key visibility toggle state
   const [visibleKeys, setVisibleKeys] = useState(new Set());
+
+  // Connection quota tracking for each API key
+  const [keyQuotas, setKeyQuotas] = useState({}); // {keyId: {used, total, loading, error}}
 
   // Client-side local/remote detection (UI hint only, not a security gate)
   const [isRemoteHost, setIsRemoteHost] = useState(false);
@@ -204,6 +245,16 @@ export default function APIPageClient({ machineId }) {
         setRequireLogin(data.requireLogin !== false);
         setHasPassword(data.hasPassword || false);
         setTunnelDashboardAccess(data.tunnelDashboardAccess || false);
+        
+        // Token Auto-Refresh settings
+        setTokenAutoRefreshEnabled(data.tokenAutoRefresh?.enabled || false);
+        setTokenAutoRefreshLastRunAt(data.tokenAutoRefresh?.lastRunAt || null);
+        setTokenAutoRefreshStats(data.tokenAutoRefresh?.lastRunStats || {
+          accountsChecked: 0,
+          accountsRefreshed: 0,
+          successCount: 0,
+          failureCount: 0,
+        });
       }
       if (statusRes.ok) {
         const data = await statusRes.json();
@@ -253,32 +304,121 @@ export default function APIPageClient({ machineId }) {
     }
   };
 
+  const handleTokenAutoRefreshToggle = async (value) => {
+    try {
+      const res = await fetch("/api/settings", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          tokenAutoRefresh: {
+            enabled: value,
+            lastRunAt: tokenAutoRefreshLastRunAt,
+            lastRunStats: tokenAutoRefreshStats,
+          },
+        }),
+      });
+      if (res.ok) {
+        setTokenAutoRefreshEnabled(value);
+        // Reload settings to get updated stats
+        setTimeout(() => loadSettings(), 1000);
+      }
+    } catch (error) {
+      console.log("Error updating tokenAutoRefresh:", error);
+    }
+  };
+
   const fetchData = async () => {
     try {
-      const fetchKeys = async () => {
-        const res = await fetch("/api/keys");
-        if (!res.ok) return [];
-        const data = await res.json();
-        return data.keys || [];
-      };
-
-      let existing = await fetchKeys();
-      // Auto-provision a default key for first-time users so the endpoint works out of the box.
-      if (existing.length === 0) {
-        try {
-          const createRes = await fetch("/api/keys", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ name: "Default Key" }),
-          });
-          if (createRes.ok) existing = await fetchKeys();
-        } catch { /* fall through to empty render */ }
+      const keysRes = await fetch("/api/keys");
+      const keysData = await keysRes.json();
+      if (keysRes.ok) {
+        const keys = keysData.keys || [];
+        setKeys(keys);
+        // Fetch quota using batch approach
+        await fetchAllKeyQuotas(keys);
       }
-      setKeys(existing);
     } catch (error) {
       console.log("Error fetching data:", error);
     } finally {
       setLoading(false);
+    }
+  };
+
+  // Fetch and aggregate quota for all API keys in one optimized batch
+  const fetchAllKeyQuotas = async (keys) => {
+    try {
+      // Set loading state for all keys
+      const loadingState = {};
+      keys.forEach(key => {
+        loadingState[key.id] = {loading: true};
+      });
+      setKeyQuotas(loadingState);
+
+      // Fetch connection assignments in one call
+      const assignmentsRes = await fetch('/api/keys/credits');
+      if (!assignmentsRes.ok) {
+        console.log("Failed to fetch key credits");
+        return;
+      }
+
+      const { assignments } = await assignmentsRes.json();
+
+      // Process each key's quota
+      for (const key of keys) {
+        const connIds = assignments[key.id] || [];
+
+        if (connIds.length === 0) {
+          setKeyQuotas(prev => ({...prev, [key.id]: null}));
+          continue;
+        }
+
+        // Fetch quota for each assigned connection
+        const quotaPromises = connIds.map(connId =>
+          fetch(`/api/usage/${connId}`)
+            .then(r => r.ok ? r.json() : null)
+            .catch(() => null)
+        );
+        const quotasData = await Promise.all(quotaPromises);
+
+        // Aggregate credit across all connections
+        let totalUsed = 0;
+        let totalLimit = 0;
+        let hasData = false;
+
+        quotasData.forEach(quotaData => {
+          if (!quotaData?.quotas) return;
+
+          // Try common credit resource keys
+          const credit = quotaData.quotas.credit || quotaData.quotas["0"];
+
+          if (credit && credit.total !== undefined) {
+            totalUsed += credit.used || 0;
+            totalLimit += credit.total || 0;
+            hasData = true;
+          }
+        });
+
+        if (hasData) {
+          setKeyQuotas(prev => ({
+            ...prev,
+            [key.id]: {
+              used: totalUsed,
+              total: totalLimit,
+              loading: false
+            }
+          }));
+        } else {
+          setKeyQuotas(prev => ({...prev, [key.id]: null}));
+        }
+      }
+    } catch (error) {
+      console.log("Error fetching key quotas:", error);
+      keys.forEach(key => {
+        setKeyQuotas(prev => ({
+          ...prev,
+          [key.id]: {error: error.message, loading: false}
+        }));
+      });
     }
   };
 
@@ -623,24 +763,79 @@ export default function APIPageClient({ machineId }) {
   };
 
   const handleCreateKey = async () => {
-    if (!newKeyName.trim()) return;
+    if (!keyForm.name.trim()) return;
 
     try {
+      const body = {
+        name: keyForm.name,
+        tokenLimit: keyForm.tokenLimit || null,
+        requestLimit: keyForm.requestLimit || null,
+        resetPeriod: keyForm.resetPeriod,
+        customResetDays: keyForm.customResetDays || null,
+        scopeType: keyForm.scopeType,
+        allowedModels: keyForm.allowedModels.length > 0 ? keyForm.allowedModels : null,
+        allowedCombos: keyForm.allowedCombos.length > 0 ? keyForm.allowedCombos : null,
+        allocatedConnectionIds: keyForm.allocatedConnectionIds.length > 0 ? keyForm.allocatedConnectionIds : undefined,
+      };
+
       const res = await fetch("/api/keys", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newKeyName }),
+        body: JSON.stringify(body),
       });
       const data = await res.json();
 
       if (res.ok) {
         setCreatedKey(data.key);
         await fetchData();
-        setNewKeyName("");
+        // Reset form
+        setKeyForm({
+          name: "",
+          tokenLimit: null,
+          requestLimit: null,
+          resetPeriod: "monthly",
+          customResetDays: null,
+          scopeType: "global",
+          allowedModels: [],
+          allowedCombos: [],
+          allocatedConnectionIds: [],
+        });
         setShowAddModal(false);
       }
     } catch (error) {
       console.log("Error creating key:", error);
+    }
+  };
+
+  const handleUpdateKey = async () => {
+    if (!selectedKey || !keyForm.name.trim()) return;
+
+    try {
+      const body = {
+        name: keyForm.name,
+        tokenLimit: keyForm.tokenLimit || null,
+        requestLimit: keyForm.requestLimit || null,
+        resetPeriod: keyForm.resetPeriod,
+        customResetDays: keyForm.customResetDays || null,
+        scopeType: keyForm.scopeType,
+        allowedModels: keyForm.allowedModels.length > 0 ? keyForm.allowedModels : null,
+        allowedCombos: keyForm.allowedCombos.length > 0 ? keyForm.allowedCombos : null,
+        allocatedConnectionIds: keyForm.allocatedConnectionIds,
+      };
+
+      const res = await fetch(`/api/keys/${selectedKey.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (res.ok) {
+        await fetchData();
+        setShowEditModal(false);
+        setSelectedKey(null);
+      }
+    } catch (error) {
+      console.log("Error updating key:", error);
     }
   };
 
@@ -685,6 +880,101 @@ export default function APIPageClient({ machineId }) {
   const maskKey = (fullKey) => {
     if (!fullKey || fullKey.length <= 10) return fullKey || "";
     return fullKey.slice(0, 6) + "•".repeat(fullKey.length - 10) + fullKey.slice(-4);
+  };
+
+  // Fetch available connections for this API key
+  const fetchAvailableConnections = async (apiKeyId) => {
+    try {
+      const url = apiKeyId
+        ? `/api/connections/available?apiKeyId=${apiKeyId}`
+        : `/api/connections/available`;
+      const res = await fetch(url);
+      if (res.ok) {
+        const data = await res.json();
+        setAvailableConnections(data.connections || []);
+      }
+    } catch (error) {
+      console.log("Error fetching connections:", error);
+    }
+  };
+
+  // Fetch data for model/combo select modals
+  const fetchModalData = async () => {
+    try {
+      const [providersRes, aliasesRes, combosRes] = await Promise.all([
+        fetch("/api/providers"),
+        fetch("/api/models/alias"),
+        fetch("/api/combos"),
+      ]);
+      if (providersRes.ok) {
+        const providersData = await providersRes.json();
+        setActiveProviders(providersData.connections || []);
+      }
+      if (aliasesRes.ok) {
+        const aliasesData = await aliasesRes.json();
+        setModelAliases(aliasesData.aliases || {});
+      }
+      if (combosRes.ok) {
+        const combosData = await combosRes.json();
+        setCombos((combosData.combos || []).filter(c => !c.kind || c.kind === "llm"));
+      }
+    } catch (error) {
+      console.error("Error fetching modal data:", error);
+    }
+  };
+
+  // Handlers for model/combo select
+  const handleAddModel = (model) => {
+    if (!keyForm.allowedModels.includes(model.value)) {
+      setKeyForm({ ...keyForm, allowedModels: [...keyForm.allowedModels, model.value] });
+    }
+  };
+
+  const handleRemoveModel = (modelValue) => {
+    setKeyForm({ ...keyForm, allowedModels: keyForm.allowedModels.filter(m => m !== modelValue) });
+  };
+
+  const handleAddCombo = (comboName) => {
+    if (!keyForm.allowedCombos.includes(comboName)) {
+      setKeyForm({ ...keyForm, allowedCombos: [...keyForm.allowedCombos, comboName] });
+    }
+  };
+
+  const handleRemoveCombo = (comboName) => {
+    setKeyForm({ ...keyForm, allowedCombos: keyForm.allowedCombos.filter(c => c !== comboName) });
+  };
+
+  const handleAddConnection = (connectionId) => {
+    if (!keyForm.allocatedConnectionIds.includes(connectionId)) {
+      setKeyForm({
+        ...keyForm,
+        allocatedConnectionIds: [...keyForm.allocatedConnectionIds, connectionId]
+      });
+    }
+  };
+
+  const handleRemoveConnection = (connectionId) => {
+    setKeyForm({
+      ...keyForm,
+      allocatedConnectionIds: keyForm.allocatedConnectionIds.filter(id => id !== connectionId)
+    });
+  };
+
+  const handleToggleConnection = (connectionId) => {
+    if (keyForm.allocatedConnectionIds.includes(connectionId)) {
+      handleRemoveConnection(connectionId);
+    } else {
+      handleAddConnection(connectionId);
+    }
+  };
+
+  const toggleProviderExpansion = (provider) => {
+    setExpandedProviders(prev => {
+      const next = new Set(prev);
+      if (next.has(provider)) next.delete(provider);
+      else next.add(provider);
+      return next;
+    });
   };
 
   const toggleKeyVisibility = (keyId) => {
@@ -963,6 +1253,85 @@ export default function APIPageClient({ machineId }) {
         )}
       </Card>
 
+      {/* Token Auto-Refresh */}
+      <Card>
+        <div className="flex items-center justify-between mb-4">
+          <h2 className="text-lg font-semibold flex items-center gap-2">
+            <span className="material-symbols-outlined text-primary">autorenew</span>
+            Token Auto-Refresh
+          </h2>
+        </div>
+
+        <div className="flex items-center justify-between pb-4 mb-4 border-b border-border">
+          <div>
+            <p className="font-medium">Automatic Token Refresh</p>
+            <p className="text-sm text-text-muted">
+              Automatically refresh OAuth tokens before they expire (runs every 10 minutes, 20% lifetime threshold)
+            </p>
+          </div>
+          <Toggle
+            checked={tokenAutoRefreshEnabled}
+            onChange={() => handleTokenAutoRefreshToggle(!tokenAutoRefreshEnabled)}
+          />
+        </div>
+
+        {tokenAutoRefreshEnabled && (
+          <div className="space-y-3">
+            <div className="text-sm">
+              <p className="font-medium mb-3 flex items-center gap-2">
+                <span className="material-symbols-outlined text-[18px]">info</span>
+                Status
+              </p>
+              
+              <div className="bg-surface-hover p-3 rounded-lg mb-3">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-text-muted text-xs">Last Run</p>
+                    <p className="font-mono text-xs mt-0.5">
+                      {tokenAutoRefreshLastRunAt 
+                        ? new Date(tokenAutoRefreshLastRunAt).toLocaleString()
+                        : 'Not yet run'}
+                    </p>
+                  </div>
+                  <div className="text-right">
+                    <p className="text-text-muted text-xs">Schedule</p>
+                    <p className="text-xs mt-0.5">Every 10 minutes</p>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="grid grid-cols-2 gap-3 mb-3">
+                <div className="bg-surface-hover p-3 rounded-lg">
+                  <p className="text-text-muted text-xs mb-1">Accounts Checked</p>
+                  <p className="text-2xl font-semibold">{tokenAutoRefreshStats.accountsChecked}</p>
+                </div>
+                <div className="bg-surface-hover p-3 rounded-lg">
+                  <p className="text-text-muted text-xs mb-1">Accounts Refreshed</p>
+                  <p className="text-2xl font-semibold">{tokenAutoRefreshStats.accountsRefreshed}</p>
+                </div>
+              </div>
+              
+              <div className="grid grid-cols-2 gap-3">
+                <div className="bg-green-500/10 border border-green-500/20 p-3 rounded-lg flex items-center gap-2">
+                  <span className="material-symbols-outlined text-green-500 text-[20px]">check_circle</span>
+                  <div>
+                    <p className="text-text-muted text-xs">Success</p>
+                    <p className="text-lg font-semibold text-green-500">{tokenAutoRefreshStats.successCount}</p>
+                  </div>
+                </div>
+                <div className="bg-red-500/10 border border-red-500/20 p-3 rounded-lg flex items-center gap-2">
+                  <span className="material-symbols-outlined text-red-500 text-[20px]">error</span>
+                  <div>
+                    <p className="text-text-muted text-xs">Failed</p>
+                    <p className="text-lg font-semibold text-red-500">{tokenAutoRefreshStats.failureCount}</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </Card>
+
       {/* API Keys */}
       <Card id="require-api-key">
         <div className="flex items-center justify-between mb-4">
@@ -1010,17 +1379,25 @@ export default function APIPageClient({ machineId }) {
             {keys.map((key) => (
               <div
                 key={key.id}
-                className={`group flex items-center justify-between py-3 border-b border-black/[0.03] dark:border-white/[0.03] last:border-b-0 ${key.isActive === false ? "opacity-60" : ""}`}
+                className={`group flex items-center justify-between py-3 border-b border-black/10 dark:border-white/10 last:border-b-0 ${key.isActive === false ? "opacity-60" : ""}`}
               >
                 <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium">{key.name}</p>
+                  <div className="flex items-center gap-2">
+                    <p className="text-sm font-medium">{key.name}</p>
+                    {key.scopeType === 'restricted' && (
+                      <p className="text-xs text-amber-600 dark:text-amber-400 flex items-center gap-1 shrink-0">
+                        <span className="material-symbols-outlined text-[14px]">lock</span>
+                        <span className="hidden sm:inline">Restricted to specific models</span>
+                      </p>
+                    )}
+                  </div>
                   <div className="flex items-center gap-2 mt-1">
                     <code className="text-xs text-text-muted font-mono">
                       {visibleKeys.has(key.id) ? key.key : maskKey(key.key)}
                     </code>
                     <button
                       onClick={() => toggleKeyVisibility(key.id)}
-                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary transition-all"
+                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-all"
                       title={visibleKeys.has(key.id) ? "Hide key" : "Show key"}
                     >
                       <span className="material-symbols-outlined text-[14px]">
@@ -1029,7 +1406,7 @@ export default function APIPageClient({ machineId }) {
                     </button>
                     <button
                       onClick={() => copy(key.key, key.id)}
-                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary transition-all"
+                      className="p-1 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-all"
                     >
                       <span className="material-symbols-outlined text-[14px]">
                         {copied === key.id ? "check" : "content_copy"}
@@ -1038,12 +1415,126 @@ export default function APIPageClient({ machineId }) {
                   </div>
                   <p className="text-xs text-text-muted mt-1">
                     Created {new Date(key.createdAt).toLocaleDateString()}
+                    {(key.tokenLimit || key.requestLimit) && key.resetAt && (
+                      <> | Resets {new Date(key.resetAt).toLocaleDateString()}</>
+                    )}
                   </p>
                   {key.isActive === false && (
                     <p className="text-xs text-orange-500 mt-1">Paused</p>
                   )}
+
+                  {/* Usage stats - combined horizontal layout */}
+                  {(key.tokenLimit || key.requestLimit || (keyQuotas[key.id] && !keyQuotas[key.id].loading && !keyQuotas[key.id].error && keyQuotas[key.id].total > 0)) && (
+                    <div className="mt-2 flex gap-3">
+                      {key.tokenLimit && (
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between text-[10px] mb-0.5">
+                            <span className="text-text-muted">Tokens</span>
+                            <span className={`font-medium ${(key.tokensUsed / key.tokenLimit) > 0.9 ? 'text-red-500' : (key.tokensUsed / key.tokenLimit) > 0.7 ? 'text-amber-500' : 'text-green-500'}`}>
+                              {key.tokensUsed.toLocaleString()}/{key.tokenLimit.toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="h-1 w-full bg-black/5 dark:bg-white/5 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full transition-all ${(key.tokensUsed / key.tokenLimit) > 0.9 ? 'bg-red-500' : (key.tokensUsed / key.tokenLimit) > 0.7 ? 'bg-amber-500' : 'bg-green-500'}`}
+                              style={{ width: `${Math.min(100, (key.tokensUsed / key.tokenLimit) * 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                      {key.requestLimit && (
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between text-[10px] mb-0.5">
+                            <span className="text-text-muted">Requests</span>
+                            <span className={`font-medium ${(key.requestsUsed / key.requestLimit) > 0.9 ? 'text-red-500' : (key.requestsUsed / key.requestLimit) > 0.7 ? 'text-amber-500' : 'text-green-500'}`}>
+                              {key.requestsUsed.toLocaleString()}/{key.requestLimit.toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="h-1 w-full bg-black/5 dark:bg-white/5 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full transition-all ${(key.requestsUsed / key.requestLimit) > 0.9 ? 'bg-red-500' : (key.requestsUsed / key.requestLimit) > 0.7 ? 'bg-amber-500' : 'bg-green-500'}`}
+                              style={{ width: `${Math.min(100, (key.requestsUsed / key.requestLimit) * 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                      {keyQuotas[key.id] && !keyQuotas[key.id].loading && !keyQuotas[key.id].error && keyQuotas[key.id].total > 0 && (
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center justify-between text-[10px] mb-0.5">
+                            <span className="text-text-muted">Credit</span>
+                            <span className={`font-medium ${
+                              (keyQuotas[key.id].used / keyQuotas[key.id].total) > 0.7
+                                ? 'text-red-500'
+                                : (keyQuotas[key.id].used / keyQuotas[key.id].total) > 0.3
+                                  ? 'text-amber-500'
+                                  : 'text-green-500'
+                            }`}>
+                              {keyQuotas[key.id].used.toLocaleString()}/{keyQuotas[key.id].total.toLocaleString()}
+                            </span>
+                          </div>
+                          <div className="h-1 w-full bg-black/5 dark:bg-white/5 rounded-full overflow-hidden">
+                            <div
+                              className={`h-full transition-all ${
+                                (keyQuotas[key.id].used / keyQuotas[key.id].total) > 0.7
+                                  ? 'bg-red-500'
+                                  : (keyQuotas[key.id].used / keyQuotas[key.id].total) > 0.3
+                                    ? 'bg-amber-500'
+                                    : 'bg-green-500'
+                              }`}
+                              style={{ width: `${Math.min(100, (keyQuotas[key.id].used / keyQuotas[key.id].total) * 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <div className="flex items-center gap-2">
+                  <button
+                    onClick={async () => {
+                      // Open modal immediately for better UX
+                      setSelectedKey(key);
+                      setShowEditModal(true);
+
+                      // Set initial form with empty connections (will load async)
+                      setKeyForm({
+                        name: key.name,
+                        tokenLimit: key.tokenLimit,
+                        requestLimit: key.requestLimit,
+                        resetPeriod: key.resetPeriod || 'monthly',
+                        customResetDays: key.customResetDays,
+                        scopeType: key.scopeType || 'global',
+                        allowedModels: key.allowedModels || [],
+                        allowedCombos: key.allowedCombos || [],
+                        allocatedConnectionIds: [], // Will be populated below
+                      });
+
+                      // Fetch data in background (modal already open)
+                      fetchModalData();
+                      fetchAvailableConnections(key.id);
+
+                      // Fetch only assigned connections for this key (not all 2k)
+                      try {
+                        const connRes = await fetch(`/api/connections?assignedToApiKeyId=${key.id}`);
+                        if (connRes.ok) {
+                          const connData = await connRes.json();
+                          const allocated = connData.connections.map(c => c.id);
+
+                          // Update form with allocated connections
+                          setKeyForm(prev => ({
+                            ...prev,
+                            allocatedConnectionIds: allocated,
+                          }));
+                        }
+                      } catch (error) {
+                        console.log("Error fetching allocated connections:", error);
+                      }
+                    }}
+                    className="p-2 hover:bg-black/5 dark:hover:bg-white/5 rounded text-text-muted hover:text-primary opacity-100 sm:opacity-0 sm:group-hover:opacity-100 transition-all"
+                    title="Edit key"
+                  >
+                    <span className="material-symbols-outlined text-[18px]">edit</span>
+                  </button>
                   <Toggle
                     size="sm"
                     checked={key.isActive ?? true}
@@ -1082,24 +1573,476 @@ export default function APIPageClient({ machineId }) {
         title="Create API Key"
         onClose={() => {
           setShowAddModal(false);
-          setNewKeyName("");
+          setKeyForm({
+            name: "",
+            tokenLimit: null,
+            requestLimit: null,
+            resetPeriod: "monthly",
+            customResetDays: null,
+            scopeType: "global",
+            allowedModels: [],
+            allowedCombos: [],
+            allocatedConnectionIds: [],
+          });
         }}
       >
         <div className="flex flex-col gap-4">
-          <Input
-            label="Key Name"
-            value={newKeyName}
-            onChange={(e) => setNewKeyName(e.target.value)}
-            placeholder="Production Key"
-          />
+          <div className="flex flex-col gap-4 max-h-[60vh] overflow-y-auto">
+            <Input
+              label="Key Name"
+              value={keyForm.name}
+              onChange={(e) => setKeyForm({ ...keyForm, name: e.target.value })}
+              placeholder="Production Key"
+            />
+
+          <div className="grid grid-cols-2 gap-3">
+            <Input
+              label="Token Limit (optional)"
+              type="number"
+              value={keyForm.tokenLimit || ""}
+              onChange={(e) => setKeyForm({ ...keyForm, tokenLimit: e.target.value ? parseInt(e.target.value) : null })}
+              placeholder="e.g. 1000000"
+            />
+            <Input
+              label="Request Limit (optional)"
+              type="number"
+              value={keyForm.requestLimit || ""}
+              onChange={(e) => setKeyForm({ ...keyForm, requestLimit: e.target.value ? parseInt(e.target.value) : null })}
+              placeholder="e.g. 10000"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium text-text-main mb-1">Reset Period</label>
+              <select
+                value={keyForm.resetPeriod}
+                onChange={(e) => setKeyForm({ ...keyForm, resetPeriod: e.target.value })}
+                className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+              >
+                <option value="daily">Daily</option>
+                <option value="monthly">Monthly</option>
+                <option value="custom">Custom</option>
+                <option value="never">Never</option>
+              </select>
+            </div>
+            {keyForm.resetPeriod === 'custom' && (
+              <Input
+                label="Custom Reset Days"
+                type="number"
+                value={keyForm.customResetDays || ""}
+                onChange={(e) => setKeyForm({ ...keyForm, customResetDays: e.target.value ? parseInt(e.target.value) : null })}
+                placeholder="e.g. 7"
+              />
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-text-main mb-1">Access Scope</label>
+            <select
+              value={keyForm.scopeType}
+              onChange={(e) => setKeyForm({ ...keyForm, scopeType: e.target.value })}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            >
+              <option value="global">Global (all models)</option>
+              <option value="restricted">Restricted (specific models/combos)</option>
+            </select>
+          </div>
+
+          {keyForm.scopeType === 'restricted' && (
+            <>
+              <div>
+                <label className="block text-sm font-medium text-text-main mb-1.5">Allowed Models</label>
+                {keyForm.allowedModels.length === 0 ? (
+                  <div className="text-center py-3 border border-dashed border-black/10 dark:border-white/10 rounded-lg bg-black/[0.01] dark:bg-white/[0.01]">
+                    <p className="text-xs text-text-muted">No models selected</p>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5 p-2 border border-border rounded-lg bg-surface-1 mb-2">
+                    {keyForm.allowedModels.map((model) => (
+                      <span
+                        key={model}
+                        className="inline-flex items-center gap-1 rounded bg-primary/10 px-2 py-1 font-mono text-xs text-primary"
+                      >
+                        {model}
+                        <button
+                          onClick={() => handleRemoveModel(model)}
+                          className="hover:bg-primary/20 rounded-sm p-0.5"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">close</span>
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <button
+                  onClick={() => {
+                    fetchModalData();
+                    setShowModelSelect(true);
+                  }}
+                  type="button"
+                  className="w-full mt-1 py-2 border border-dashed border-black/10 dark:border-white/10 rounded-lg text-xs text-primary font-medium hover:border-primary/50 transition-colors flex items-center justify-center gap-1"
+                >
+                  <span className="material-symbols-outlined text-[16px]">add</span>
+                  Add Model
+                </button>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-text-main mb-1.5">Allowed Combos</label>
+                {keyForm.allowedCombos.length === 0 ? (
+                  <div className="text-center py-3 border border-dashed border-black/10 dark:border-white/10 rounded-lg bg-black/[0.01] dark:bg-white/[0.01]">
+                    <p className="text-xs text-text-muted">No combos selected</p>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5 p-2 border border-border rounded-lg bg-surface-1 mb-2">
+                    {keyForm.allowedCombos.map((combo) => (
+                      <span
+                        key={combo}
+                        className="inline-flex items-center gap-1 rounded bg-primary/10 px-2 py-1 font-mono text-xs text-primary"
+                      >
+                        {combo}
+                        <button
+                          onClick={() => handleRemoveCombo(combo)}
+                          className="hover:bg-primary/20 rounded-sm p-0.5"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">close</span>
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <button
+                  onClick={() => {
+                    fetchModalData();
+                    setShowComboSelect(true);
+                  }}
+                  type="button"
+                  className="w-full mt-1 py-2 border border-dashed border-black/10 dark:border-white/10 rounded-lg text-xs text-primary font-medium hover:border-primary/50 transition-colors flex items-center justify-center gap-1"
+                >
+                  <span className="material-symbols-outlined text-[16px]">add</span>
+                  Add Combo
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* Connection Allocation Section */}
+          <div>
+            <label className="block text-sm font-medium text-text-main mb-1.5">
+              Allocated Connections <span className="text-text-muted font-normal">(optional)</span>
+            </label>
+            <p className="text-xs text-text-muted mb-2">
+              Restrict this API key to specific provider connections. Leave empty to allow all connections.
+            </p>
+            {keyForm.allocatedConnectionIds.length === 0 ? (
+              <div className="text-center py-3 border border-dashed border-black/10 dark:border-white/10 rounded-lg bg-black/[0.01] dark:bg-white/[0.01]">
+                <p className="text-xs text-text-muted">No connections allocated</p>
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-1.5 p-2 border border-border rounded-lg bg-surface-1 mb-2">
+                {keyForm.allocatedConnectionIds.map((connId) => {
+                  const conn = availableConnections.find(c => c.id === connId);
+                  if (!conn) return null;
+
+                  // Use nodeName for custom providers, fallback to customPrefix or provider ID
+                  const providerDisplay = conn.providerSpecificData?.nodeName || conn.customPrefix || conn.provider;
+
+                  return (
+                    <span
+                      key={connId}
+                      className="inline-flex items-center gap-1 rounded bg-primary/10 px-2 py-1 text-xs text-primary"
+                    >
+                      <span className="font-medium">{providerDisplay}</span>
+                      <span className="text-text-muted">/</span>
+                      <span className="font-mono">{conn.displayName || conn.name}</span>
+                      <button
+                        onClick={() => handleRemoveConnection(connId)}
+                        className="hover:bg-primary/20 rounded-sm p-0.5"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">close</span>
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+            <button
+              onClick={() => {
+                fetchAvailableConnections();
+                setShowConnectionSelect(true);
+              }}
+              type="button"
+              className="w-full mt-1 py-2 border border-dashed border-black/10 dark:border-white/10 rounded-lg text-xs text-primary font-medium hover:border-primary/50 transition-colors flex items-center justify-center gap-1"
+            >
+              <span className="material-symbols-outlined text-[16px]">add</span>
+              Select Connections
+            </button>
+          </div>
+          </div>
+
           <div className="flex gap-2">
-            <Button onClick={handleCreateKey} fullWidth disabled={!newKeyName.trim()}>
+            <Button onClick={handleCreateKey} fullWidth disabled={!keyForm.name.trim()}>
               Create
             </Button>
             <Button
               onClick={() => {
                 setShowAddModal(false);
-                setNewKeyName("");
+                setKeyForm({
+                  name: "",
+                  tokenLimit: null,
+                  requestLimit: null,
+                  resetPeriod: "monthly",
+                  customResetDays: null,
+                  scopeType: "global",
+                  allowedModels: [],
+                  allowedCombos: [],
+                  allocatedConnectionIds: [],
+                });
+              }}
+              variant="ghost"
+              fullWidth
+            >
+              Cancel
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Edit Key Modal */}
+      <Modal
+        isOpen={showEditModal}
+        title="Edit API Key"
+        onClose={() => {
+          setShowEditModal(false);
+          setSelectedKey(null);
+          setKeyForm({
+            name: "",
+            tokenLimit: null,
+            requestLimit: null,
+            resetPeriod: "monthly",
+            customResetDays: null,
+            scopeType: "global",
+            allowedModels: [],
+            allowedCombos: [],
+            allocatedConnectionIds: [],
+          });
+        }}
+      >
+        <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-4 max-h-[60vh] overflow-y-auto">
+            <Input
+              label="Key Name"
+              value={keyForm.name}
+              onChange={(e) => setKeyForm({ ...keyForm, name: e.target.value })}
+              placeholder="Production Key"
+            />
+
+          <div className="grid grid-cols-2 gap-3">
+            <Input
+              label="Token Limit (optional)"
+              type="number"
+              value={keyForm.tokenLimit || ""}
+              onChange={(e) => setKeyForm({ ...keyForm, tokenLimit: e.target.value ? parseInt(e.target.value) : null })}
+              placeholder="e.g. 1000000"
+            />
+            <Input
+              label="Request Limit (optional)"
+              type="number"
+              value={keyForm.requestLimit || ""}
+              onChange={(e) => setKeyForm({ ...keyForm, requestLimit: e.target.value ? parseInt(e.target.value) : null })}
+              placeholder="e.g. 10000"
+            />
+          </div>
+
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="block text-sm font-medium text-text-main mb-1">Reset Period</label>
+              <select
+                value={keyForm.resetPeriod}
+                onChange={(e) => setKeyForm({ ...keyForm, resetPeriod: e.target.value })}
+                className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+              >
+                <option value="daily">Daily</option>
+                <option value="monthly">Monthly</option>
+                <option value="custom">Custom</option>
+                <option value="never">Never</option>
+              </select>
+            </div>
+            {keyForm.resetPeriod === 'custom' && (
+              <Input
+                label="Custom Reset Days"
+                type="number"
+                value={keyForm.customResetDays || ""}
+                onChange={(e) => setKeyForm({ ...keyForm, customResetDays: e.target.value ? parseInt(e.target.value) : null })}
+                placeholder="e.g. 7"
+              />
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-text-main mb-1">Access Scope</label>
+            <select
+              value={keyForm.scopeType}
+              onChange={(e) => setKeyForm({ ...keyForm, scopeType: e.target.value })}
+              className="w-full px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
+            >
+              <option value="global">Global (all models)</option>
+              <option value="restricted">Restricted (specific models/combos)</option>
+            </select>
+          </div>
+
+          {keyForm.scopeType === 'restricted' && (
+            <>
+              <div>
+                <label className="block text-sm font-medium text-text-main mb-1.5">Allowed Models</label>
+                {keyForm.allowedModels.length === 0 ? (
+                  <div className="text-center py-3 border border-dashed border-black/10 dark:border-white/10 rounded-lg bg-black/[0.01] dark:bg-white/[0.01]">
+                    <p className="text-xs text-text-muted">No models selected</p>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5 p-2 border border-border rounded-lg bg-surface-1 mb-2">
+                    {keyForm.allowedModels.map((model) => (
+                      <span
+                        key={model}
+                        className="inline-flex items-center gap-1 rounded bg-primary/10 px-2 py-1 font-mono text-xs text-primary"
+                      >
+                        {model}
+                        <button
+                          onClick={() => handleRemoveModel(model)}
+                          className="hover:bg-primary/20 rounded-sm p-0.5"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">close</span>
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <button
+                  onClick={() => {
+                    fetchModalData();
+                    setShowModelSelect(true);
+                  }}
+                  type="button"
+                  className="w-full mt-1 py-2 border border-dashed border-black/10 dark:border-white/10 rounded-lg text-xs text-primary font-medium hover:border-primary/50 transition-colors flex items-center justify-center gap-1"
+                >
+                  <span className="material-symbols-outlined text-[16px]">add</span>
+                  Add Model
+                </button>
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-text-main mb-1.5">Allowed Combos</label>
+                {keyForm.allowedCombos.length === 0 ? (
+                  <div className="text-center py-3 border border-dashed border-black/10 dark:border-white/10 rounded-lg bg-black/[0.01] dark:bg-white/[0.01]">
+                    <p className="text-xs text-text-muted">No combos selected</p>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-1.5 p-2 border border-border rounded-lg bg-surface-1 mb-2">
+                    {keyForm.allowedCombos.map((combo) => (
+                      <span
+                        key={combo}
+                        className="inline-flex items-center gap-1 rounded bg-primary/10 px-2 py-1 font-mono text-xs text-primary"
+                      >
+                        {combo}
+                        <button
+                          onClick={() => handleRemoveCombo(combo)}
+                          className="hover:bg-primary/20 rounded-sm p-0.5"
+                        >
+                          <span className="material-symbols-outlined text-[14px]">close</span>
+                        </button>
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <button
+                  onClick={() => {
+                    fetchModalData();
+                    setShowComboSelect(true);
+                  }}
+                  type="button"
+                  className="w-full mt-1 py-2 border border-dashed border-black/10 dark:border-white/10 rounded-lg text-xs text-primary font-medium hover:border-primary/50 transition-colors flex items-center justify-center gap-1"
+                >
+                  <span className="material-symbols-outlined text-[16px]">add</span>
+                  Add Combo
+                </button>
+              </div>
+            </>
+          )}
+
+          {/* Connection Allocation Section */}
+          <div>
+            <label className="block text-sm font-medium text-text-main mb-1.5">
+              Allocated Connections <span className="text-text-muted font-normal">(optional)</span>
+            </label>
+            <p className="text-xs text-text-muted mb-2">
+              Restrict this API key to specific provider connections. Leave empty to allow all connections.
+            </p>
+            {keyForm.allocatedConnectionIds.length === 0 ? (
+              <div className="text-center py-3 border border-dashed border-black/10 dark:border-white/10 rounded-lg bg-black/[0.01] dark:bg-white/[0.01]">
+                <p className="text-xs text-text-muted">No connections allocated</p>
+              </div>
+            ) : (
+              <div className="flex flex-wrap gap-1.5 p-2 border border-border rounded-lg bg-surface-1 mb-2">
+                {keyForm.allocatedConnectionIds.map((connId) => {
+                  const conn = availableConnections.find(c => c.id === connId);
+                  if (!conn) return null;
+
+                  // Use nodeName for custom providers, fallback to customPrefix or provider ID
+                  const providerDisplay = conn.providerSpecificData?.nodeName || conn.customPrefix || conn.provider;
+
+                  return (
+                    <span
+                      key={connId}
+                      className="inline-flex items-center gap-1 rounded bg-primary/10 px-2 py-1 text-xs text-primary"
+                    >
+                      <span className="font-medium">{providerDisplay}</span>
+                      <span className="text-text-muted">/</span>
+                      <span className="font-mono">{conn.displayName || conn.name}</span>
+                      <button
+                        onClick={() => handleRemoveConnection(connId)}
+                        className="hover:bg-primary/20 rounded-sm p-0.5"
+                      >
+                        <span className="material-symbols-outlined text-[14px]">close</span>
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+            <button
+              onClick={() => {
+                if (selectedKey) {
+                  fetchAvailableConnections(selectedKey.id);
+                }
+                setShowConnectionSelect(true);
+              }}
+              type="button"
+              className="w-full mt-1 py-2 border border-dashed border-black/10 dark:border-white/10 rounded-lg text-xs text-primary font-medium hover:border-primary/50 transition-colors flex items-center justify-center gap-1"
+            >
+              <span className="material-symbols-outlined text-[16px]">add</span>
+              Select Connections
+            </button>
+          </div>
+          </div>
+
+          <div className="flex gap-2">
+            <Button onClick={handleUpdateKey} fullWidth disabled={!keyForm.name.trim()}>
+              Update
+            </Button>
+            <Button
+              onClick={() => {
+                setShowEditModal(false);
+                setSelectedKey(null);
+                setKeyForm({
+                  name: "",
+                  tokenLimit: null,
+                  requestLimit: null,
+                  resetPeriod: "monthly",
+                  customResetDays: null,
+                  scopeType: "global",
+                  allowedModels: [],
+                  allowedCombos: [],
+                  allocatedConnectionIds: [],
+                });
               }}
               variant="ghost"
               fullWidth
@@ -1300,6 +2243,285 @@ export default function APIPageClient({ machineId }) {
         message={confirmState?.message}
         variant="danger"
       />
+
+      {/* Model Select Modal */}
+      <ModelSelectModal
+        isOpen={showModelSelect}
+        onClose={() => setShowModelSelect(false)}
+        onSelect={handleAddModel}
+        onDeselect={(model) => handleRemoveModel(model.value)}
+        activeProviders={activeProviders}
+        modelAliases={modelAliases}
+        title="Select Models"
+        addedModelValues={keyForm.allowedModels}
+        closeOnSelect={false}
+      />
+
+      {/* Combo Select Modal */}
+      <Modal
+        isOpen={showComboSelect}
+        onClose={() => setShowComboSelect(false)}
+        title="Select Combos"
+      >
+        <div className="flex flex-col gap-3">
+          {combos.length === 0 ? (
+            <p className="text-sm text-text-muted text-center py-4">No combos available</p>
+          ) : (
+            <div className="flex flex-col gap-1 max-h-[400px] overflow-y-auto">
+              {combos.map((combo) => {
+                const isSelected = keyForm.allowedCombos.includes(combo.name);
+                return (
+                  <button
+                    key={combo.name}
+                    onClick={() => {
+                      if (isSelected) {
+                        handleRemoveCombo(combo.name);
+                      } else {
+                        handleAddCombo(combo.name);
+                      }
+                    }}
+                    className={`flex items-center gap-2 px-3 py-2 rounded-lg text-left transition-colors ${
+                      isSelected
+                        ? "bg-primary/10 text-primary border border-primary/30"
+                        : "hover:bg-surface-2 border border-transparent"
+                    }`}
+                  >
+                    <span className={`material-symbols-outlined text-[18px] ${isSelected ? "text-primary" : "text-text-muted"}`}>
+                      {isSelected ? "check_box" : "check_box_outline_blank"}
+                    </span>
+                    <div className="flex-1 min-w-0">
+                      <code className="font-mono text-sm">{combo.name}</code>
+                      {combo.models && combo.models.length > 0 && (
+                        <p className="text-xs text-text-muted truncate">
+                          {combo.models.slice(0, 3).join(", ")}
+                          {combo.models.length > 3 && ` +${combo.models.length - 3} more`}
+                        </p>
+                      )}
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          <Button onClick={() => setShowComboSelect(false)} variant="ghost" fullWidth>
+            Close
+          </Button>
+        </div>
+      </Modal>
+
+      {/* Connection Select Modal */}
+      <Modal
+        isOpen={showConnectionSelect}
+        onClose={() => {
+          setShowConnectionSelect(false);
+          setConnectionSearchQuery("");
+        }}
+        title="Select Connections"
+      >
+        <div className="flex flex-col gap-3">
+          <Input
+            placeholder="Search by name or provider..."
+            value={connectionSearchQuery}
+            onChange={(e) => setConnectionSearchQuery(e.target.value)}
+          />
+
+          {(() => {
+            // Client-safe model parser (no server dependencies)
+            const parseModelProvider = (modelStr) => {
+              if (!modelStr || typeof modelStr !== 'string') return null;
+
+              // Format: provider/model or @provider/model
+              const parts = modelStr.split('/');
+              if (parts.length < 2) return null;
+
+              let providerAlias = parts[0].toLowerCase();
+
+              // Common alias mappings (must match server provider IDs)
+              const aliasMap = {
+                'kr': 'kiro',
+                '@cf': 'cloudflare',
+                'cf': 'cloudflare',
+                'ant': 'anthropic',
+                'anthropic': 'anthropic',
+                'oa': 'openai',
+                'openai': 'openai',
+                'goog': 'gemini-cli',
+                'gemini': 'gemini-cli',
+                'hf': 'huggingface',
+                'huggingface': 'huggingface',
+              };
+
+              // Remove @ prefix if exists
+              const cleanAlias = providerAlias.replace('@', '');
+
+              return aliasMap[cleanAlias] || cleanAlias;
+            };
+
+            // Helper to extract providers from model strings
+            const getProvidersFromModels = (modelStrings) => {
+              const providers = new Set();
+              for (const modelStr of modelStrings || []) {
+                const provider = parseModelProvider(modelStr);
+                if (provider) {
+                  providers.add(provider);
+                }
+              }
+              return Array.from(providers);
+            };
+
+            // Filter connections by allowed models scope
+            let connectionsToShow = availableConnections;
+
+            if (keyForm.scopeType === 'restricted' && (keyForm.allowedModels?.length > 0 || keyForm.allowedCombos?.length > 0)) {
+              const allowedProviders = new Set();
+
+              // Extract providers from allowed models
+              if (keyForm.allowedModels?.length > 0) {
+                const modelProviders = getProvidersFromModels(keyForm.allowedModels);
+                modelProviders.forEach(p => allowedProviders.add(p));
+              }
+
+              // Known built-in provider IDs (not custom)
+              const KNOWN_PROVIDERS = new Set([
+                'kiro', 'cloudflare', 'anthropic', 'openai', 'gemini-cli',
+                'huggingface', 'groq', 'cohere', 'mistral', 'perplexity',
+                'deepseek', 'together', 'fireworks', 'replicate', 'codex'
+              ]);
+
+              // Check if user allows any custom provider models (server/*, etc.)
+              const hasCustomModels = keyForm.allowedModels?.some(m => {
+                const provider = parseModelProvider(m);
+                return provider && !KNOWN_PROVIDERS.has(provider);
+              });
+
+              // Filter connections to only allowed providers
+              if (allowedProviders.size > 0 || hasCustomModels) {
+                connectionsToShow = availableConnections.filter(c => {
+                  // Include if provider matches built-in allowed providers
+                  if (allowedProviders.has(c.provider)) return true;
+
+                  // For custom providers: match by customPrefix
+                  if (hasCustomModels && c.customPrefix) {
+                    // Check if this custom provider's prefix matches any allowed model prefix
+                    return allowedProviders.has(c.customPrefix);
+                  }
+
+                  return false;
+                });
+              }
+            }
+
+            return connectionsToShow.length === 0 ? (
+              <p className="text-sm text-text-muted text-center py-4">
+                {keyForm.scopeType === 'restricted' && keyForm.allowedModels?.length > 0
+                  ? "No connections available for allowed models"
+                  : "No connections available"}
+              </p>
+            ) : (
+              <div className="flex flex-col gap-2 max-h-[60vh] overflow-y-auto">
+                {/* Accordion by provider */}
+                {Object.entries(
+                  connectionsToShow
+                    .filter(conn => {
+                      if (!connectionSearchQuery) return true;
+                      const query = connectionSearchQuery.toLowerCase();
+                      return (
+                        conn.name?.toLowerCase().includes(query) ||
+                        conn.provider?.toLowerCase().includes(query) ||
+                        conn.email?.toLowerCase().includes(query)
+                      );
+                    })
+                    .reduce((acc, conn) => {
+                      if (!acc[conn.provider]) acc[conn.provider] = [];
+                      acc[conn.provider].push(conn);
+                      return acc;
+                    }, {})
+                ).map(([provider, conns]) => {
+                const isExpanded = expandedProviders.has(provider);
+                const selectedCount = conns.filter(c => keyForm.allocatedConnectionIds.includes(c.id)).length;
+                // Use nodeName for custom providers, fallback to provider ID
+                const providerDisplayName = conns[0]?.providerSpecificData?.nodeName || provider;
+
+                return (
+                  <div key={provider} className="border border-border rounded-lg overflow-hidden">
+                    {/* Accordion Header */}
+                    <button
+                      onClick={() => toggleProviderExpansion(provider)}
+                      className="w-full flex items-center gap-2 px-3 py-2 bg-surface-1 hover:bg-surface-2 transition-colors text-left"
+                    >
+                      <span className="material-symbols-outlined text-[16px] text-text-muted">
+                        {isExpanded ? "expand_more" : "chevron_right"}
+                      </span>
+                      <span className="text-sm font-semibold text-text-main uppercase tracking-wide flex-1">
+                        {providerDisplayName}
+                      </span>
+                      <span className="text-xs text-text-muted">
+                        {conns.length} connection{conns.length !== 1 ? 's' : ''}
+                        {selectedCount > 0 && (
+                          <span className="text-primary font-medium ml-1">
+                            ({selectedCount} selected)
+                          </span>
+                        )}
+                      </span>
+                    </button>
+
+                    {/* Accordion Content */}
+                    {isExpanded && (
+                      <div className="flex flex-col gap-1 p-2 bg-background max-h-[40vh] overflow-y-auto">
+                        {conns.map((conn) => {
+                          const isSelected = keyForm.allocatedConnectionIds.includes(conn.id);
+                          const isAssignedToOther = conn.assignedToApiKeyId && conn.assignedToApiKeyId !== selectedKey?.id;
+
+                          return (
+                            <button
+                              key={conn.id}
+                              onClick={() => {
+                                if (!isAssignedToOther) {
+                                  handleToggleConnection(conn.id);
+                                }
+                              }}
+                              disabled={isAssignedToOther}
+                              className={`flex items-center gap-2 px-3 py-2 rounded-lg text-left transition-colors ${
+                                isSelected
+                                  ? "bg-primary/10 text-primary border border-primary/30"
+                                  : isAssignedToOther
+                                  ? "opacity-50 cursor-not-allowed border border-transparent"
+                                  : "hover:bg-surface-2 border border-transparent"
+                              }`}
+                            >
+                              <span className={`material-symbols-outlined text-[18px] ${isSelected ? "text-primary" : "text-text-muted"}`}>
+                                {isSelected ? "check_box" : "check_box_outline_blank"}
+                              </span>
+                              <div className="flex-1 min-w-0">
+                                <div className="flex items-center gap-2">
+                                  <code className="font-mono text-sm">{conn.displayName || conn.name}</code>
+                                  {isAssignedToOther && (
+                                    <span className="text-xs text-amber-600 dark:text-amber-400">(assigned)</span>
+                                  )}
+                                </div>
+                                {conn.email && (
+                                  <p className="text-xs text-text-muted truncate">{conn.email}</p>
+                                )}
+                              </div>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          );
+          })()}
+          <Button onClick={() => {
+            setShowConnectionSelect(false);
+            setConnectionSearchQuery("");
+          }} variant="ghost" fullWidth>
+            Close
+          </Button>
+        </div>
+      </Modal>
     </div>
   );
 }

@@ -17,6 +17,7 @@ import { resolveCursorModels } from "open-sse/services/cursorModels.js";
 import { resolveZedModels } from "open-sse/shared/zedAuth.js";
 import { updateProviderCredentials } from "@/sse/services/tokenRefresh";
 import { resolveConnectionProxyConfig } from "@/lib/network/connectionProxy";
+import { GET as getProviderModelsRoute } from "@/app/api/providers/[id]/models/route.js";
 import { capabilitiesFromServiceKind, getCapabilitiesForModel } from "open-sse/providers/capabilities.js";
 
 // Per-provider live model resolvers. Each receives a connection record and
@@ -32,12 +33,22 @@ const LIVE_MODEL_RESOLVERS = {
     return result?.models?.length ? { models: result.models } : null;
   },
   qoder: async (conn) => {
+    const proxy = await resolveConnectionProxyConfig(conn.providerSpecificData || {});
     const result = await resolveQoderModels({
+      apiKey: conn.apiKey,
       accessToken: conn.accessToken,
       refreshToken: conn.refreshToken,
       email: conn.email,
       displayName: conn.displayName,
       providerSpecificData: conn.providerSpecificData || {}
+    }, {
+      proxyOptions: {
+        connectionProxyEnabled: proxy.connectionProxyEnabled === true,
+        connectionProxyUrl: proxy.connectionProxyUrl || "",
+        connectionNoProxy: proxy.connectionNoProxy || "",
+        vercelRelayUrl: proxy.vercelRelayUrl || "",
+        strictProxy: proxy.strictProxy === true,
+      },
     });
     if (!result?.models?.length) return null;
     return {
@@ -123,6 +134,107 @@ const LIVE_MODEL_RESOLVERS = {
     };
   },
 };
+
+const LIVE_DISCOVERY_TTL_MS = 60 * 1000;
+const LIVE_DISCOVERY_TIMEOUT_MS = 6 * 1000;
+const LIVE_DISCOVERY_CONCURRENCY = 4;
+const liveDiscoveryCache = new Map();
+
+function normalizeLiveModelEntries(data) {
+  const rawModels = Array.isArray(data)
+    ? data
+    : (data?.data || data?.models || data?.results || []);
+  if (!Array.isArray(rawModels)) return [];
+
+  return rawModels
+    .map((model) => {
+      if (typeof model === "string") return { id: model, name: model };
+      if (!model || typeof model !== "object") return null;
+      const id = model.id || model.name || model.model;
+      if (!id || typeof id !== "string") return null;
+      return {
+        ...model,
+        id,
+        name: model.name || model.display_name || model.displayName || id,
+      };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Call the authoritative per-connection provider model route. Keeping this
+ * behind a short cache prevents Hermes `/model` refreshes from refetching
+ * every upstream on every request while still refreshing connected catalogs.
+ */
+async function fetchLiveModelsForConnection(connection) {
+  if (!connection?.id) return null;
+  const cacheKey = `${connection.provider}:${connection.id}`;
+  const now = Date.now();
+  const cached = liveDiscoveryCache.get(cacheKey);
+  if (cached && cached.expiresAt > now) return cached.value;
+
+  try {
+    const response = await getProviderModelsRoute(
+      new Request(`http://9router.internal/api/providers/${encodeURIComponent(connection.id)}/models`),
+      { params: { id: connection.id } },
+    );
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) return null;
+
+    const models = normalizeLiveModelEntries(data?.models || data);
+    if (models.length === 0) return null;
+
+    const value = { models };
+    liveDiscoveryCache.set(cacheKey, {
+      expiresAt: now + LIVE_DISCOVERY_TTL_MS,
+      value,
+    });
+    return value;
+  } catch (error) {
+    console.log(`Live model discovery failed for ${connection.provider}: ${error?.message || error}`);
+    return null;
+  }
+}
+
+/**
+ * Discover one connected account per provider with bounded concurrency and a
+ * global budget. Provider catalogs are normally provider-scoped; probing every
+ * account in a large pool would make `/v1/models` unusable for Hermes/clients.
+ */
+async function discoverLiveModels(activeConnectionByProvider, kindFilter, skipDynamicFetch) {
+  if (skipDynamicFetch) return new Map();
+
+  const candidates = Array.from(activeConnectionByProvider.entries())
+    .filter(([providerId, connection]) => {
+      if (!providerMatchesKinds(providerId, kindFilter)) return false;
+      const enabledModels = connection?.providerSpecificData?.enabledModels;
+      return !(Array.isArray(enabledModels) && enabledModels.length > 0);
+    });
+  const discovered = new Map();
+  let nextIndex = 0;
+
+  const worker = async () => {
+    while (true) {
+      const index = nextIndex++;
+      if (index >= candidates.length) return;
+      const [providerId, connection] = candidates[index];
+      const result = await fetchLiveModelsForConnection(connection);
+      if (result?.models?.length) discovered.set(providerId, result);
+    }
+  };
+
+  const workers = Array.from(
+    { length: Math.min(LIVE_DISCOVERY_CONCURRENCY, candidates.length) },
+    () => worker(),
+  );
+  if (workers.length === 0) return discovered;
+
+  await Promise.race([
+    Promise.all(workers),
+    new Promise((resolve) => setTimeout(resolve, LIVE_DISCOVERY_TIMEOUT_MS)),
+  ]);
+  return discovered;
+}
 
 const parseOpenAIStyleModels = (data) => {
   if (Array.isArray(data)) return data;
@@ -290,6 +402,12 @@ export async function buildModelsList(kindFilter, options = {}) {
     }
   }
 
+  const liveCatalogByProvider = await discoverLiveModels(
+    activeConnectionByProvider,
+    kindFilter,
+    skipDynamicFetch,
+  );
+
   const models = [];
 
   // Combos first (filtered by kind). Web combos expose `kind` so AI knows search vs fetch.
@@ -375,15 +493,40 @@ export async function buildModelsList(kindFilter, options = {}) {
           )
         : providerModels.map((model) => model.id);
 
-      if (isCompatibleProvider && rawModelIds.length === 0 && !skipDynamicFetch) {
-        rawModelIds = await fetchCompatibleModelIds(conn);
+      const discoveredLive = liveCatalogByProvider.get(providerId);
+      if (discoveredLive?.models?.length && !hasExplicitEnabledModels) {
+        rawModelIds = discoveredLive.models.map((m) => m.id);
+        liveModelKindById = new Map(
+          discoveredLive.models
+            .filter((m) => m?.id)
+            .map((m) => [m.id, modelKind(m)])
+        );
+        liveCapabilitiesById = new Map(
+          discoveredLive.models
+            .filter((m) => m?.id && m.capabilities)
+            .map((m) => [m.id, m.capabilities])
+        );
       }
 
-      // Config-driven live catalog override (e.g. Kiro returns dynamic
-      // -thinking/-agentic variants per account). On failure, fall back to
-      // whatever rawModelIds already holds.
+      if (
+        !discoveredLive?.models?.length
+        && isCompatibleProvider
+        && !hasExplicitEnabledModels
+        && !skipDynamicFetch
+      ) {
+        const compatibleModels = await fetchCompatibleModelIds(conn);
+        if (compatibleModels.length > 0) rawModelIds = compatibleModels;
+      }
+
+      // Config-driven live catalog fallback for providers whose dedicated
+      // resolver is not exposed through the generic provider model route.
       const liveResolver = LIVE_MODEL_RESOLVERS[providerId];
-      if (liveResolver && !hasExplicitEnabledModels) {
+      if (
+        !discoveredLive?.models?.length
+        && liveResolver
+        && !hasExplicitEnabledModels
+        && !skipDynamicFetch
+      ) {
         try {
           const live = await liveResolver(conn);
           if (live?.models?.length) {

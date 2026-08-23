@@ -1,12 +1,10 @@
 services:
   9router:
-    image: decolua/9router:latest
+    image: 9router-custom:apikey-v2-port-20260823
     container_name: 9router
-    restart: always
+    restart: unless-stopped
     ports:
       - "127.0.0.1:20128:20128"
-    volumes:
-      - 9router-data:/app/data
     env_file:
       - .env
     environment:
@@ -14,5 +12,5 @@ services:
       PORT: "20128"
       HOSTNAME: "0.0.0.0"
       NODE_ENV: production
-      - headroom
-
+    volumes:
+      - /opt/9router-new/data:/app/data

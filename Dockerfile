@@ -16,6 +16,12 @@ COPY . ./
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
 
+# got-scraping is imported dynamically (webpackIgnore) so Next standalone tracing
+# never bundles it; stage a pinned runtime tree and copy it into the runner.
+FROM base AS got-runtime
+WORKDIR /tmp/got-runtime
+RUN npm init -y >/dev/null && npm install --no-audit --no-fund --save-exact got-scraping@4.2.1
+
 FROM ${NODE_IMAGE} AS runner
 WORKDIR /app
 
@@ -36,6 +42,10 @@ COPY --from=builder /app/open-sse ./open-sse
 COPY --from=builder /app/src/mitm ./src/mitm
 # Standalone node_modules may omit deps only required by the MITM child process.
 COPY --from=builder /app/node_modules/node-forge ./node_modules/node-forge
+# proxyFetch dynamically imports undici; Next standalone tracing does not include dynamic imports.
+COPY --from=builder /app/node_modules/undici ./node_modules/undici
+# got-scraping runtime closure (see got-runtime stage above).
+COPY --from=got-runtime /tmp/got-runtime/node_modules ./node_modules
 # Ensure `next` is available at runtime in case tracing did not include it.
 COPY --from=builder /app/node_modules/next ./node_modules/next
 # sql.js loads dist/sql-wasm.wasm by path at runtime; tracing only follows JS imports,

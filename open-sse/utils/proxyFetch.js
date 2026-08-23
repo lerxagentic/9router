@@ -5,6 +5,135 @@ import { dbg } from "./debugLog.js";
 const originalFetch = globalThis.fetch;
 const proxyDispatchers = new Map();
 
+let gotScrapingModule = null;
+let gotScrapingChecked = false;
+
+function isTabitokenTarget(targetUrl) {
+  try {
+    const hostname = new URL(targetUrl).hostname.toLowerCase();
+    return hostname === "tabitoken.com" || hostname.endsWith(".tabitoken.com");
+  } catch {
+    return false;
+  }
+}
+
+function headersToObject(headers) {
+  if (!headers) return {};
+  if (typeof headers.entries === "function") return Object.fromEntries(headers.entries());
+  return { ...headers };
+}
+
+function responseHeaders(rawHeaders = {}) {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(rawHeaders)) {
+    if (name.startsWith(":")) continue;
+    if (Array.isArray(value)) value.forEach((item) => headers.append(name, String(item)));
+    else if (value !== undefined && value !== null) headers.set(name, String(value));
+  }
+  return headers;
+}
+
+function isStreamingRequest(headers) {
+  const accept = String(headers.accept || headers.Accept || "").toLowerCase();
+  return accept.includes("text/event-stream");
+}
+
+async function getGotScraping() {
+  if (gotScrapingChecked) return gotScrapingModule;
+  gotScrapingChecked = true;
+  try {
+    const mod = await import(/* webpackIgnore: true */ "got-scraping");
+    gotScrapingModule = mod.gotScraping || mod.default || null;
+  } catch {
+    gotScrapingModule = null;
+  }
+  return gotScrapingModule;
+}
+
+function buildGotScrapingOptions(options, proxyUrl) {
+  const method = String(options.method || "GET").toUpperCase();
+  const headers = headersToObject(options.headers);
+  const gotOptions = {
+    method,
+    headers,
+    proxyUrl,
+    throwHttpErrors: false,
+    retry: { limit: 0 },
+  };
+
+  if (options.signal) gotOptions.signal = options.signal;
+  if (options.body !== undefined && options.body !== null && method !== "GET" && method !== "HEAD") {
+    gotOptions.body = typeof options.body === "string" || Buffer.isBuffer(options.body)
+      ? options.body
+      : Buffer.from(options.body);
+  }
+
+  return gotOptions;
+}
+
+async function gotScrapingFetch(targetUrl, options, proxyUrl) {
+  const gotScraping = await getGotScraping();
+  if (!gotScraping) throw new Error("got-scraping unavailable");
+
+  const gotOptions = buildGotScrapingOptions(options, proxyUrl);
+  if (isTabitokenTarget(targetUrl)) {
+    const browserHeaders = {
+      Origin: "https://tabitoken.com",
+      Referer: "https://tabitoken.com/",
+      "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+      "Accept-Language": "en-US,en;q=0.9",
+      "Sec-Fetch-Site": "same-origin",
+      "Sec-Fetch-Mode": "cors",
+      "Sec-Fetch-Dest": "empty",
+      "Accept-Encoding": "gzip, deflate, br",
+    };
+    for (const [name, value] of Object.entries(browserHeaders)) {
+      if (!gotOptions.headers[name] && !gotOptions.headers[name.toLowerCase()]) gotOptions.headers[name] = value;
+    }
+  }
+  if (isStreamingRequest(gotOptions.headers)) {
+    return new Promise((resolve, reject) => {
+      const stream = gotScraping.stream(targetUrl, gotOptions);
+      let settled = false;
+
+      const onAbort = () => {
+        try { stream.destroy(new Error("aborted")); } catch { }
+      };
+      if (options.signal) {
+        if (options.signal.aborted) onAbort();
+        else options.signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      stream.once("response", (res) => {
+        if (settled) return;
+        settled = true;
+        if (options.signal) options.signal.removeEventListener("abort", onAbort);
+        resolve(new Response(Readable.toWeb(stream), {
+          status: res.statusCode,
+          statusText: res.statusMessage || "",
+          headers: responseHeaders(res.headers),
+        }));
+      });
+      stream.once("error", (error) => {
+        if (settled) return;
+        settled = true;
+        if (options.signal) options.signal.removeEventListener("abort", onAbort);
+        reject(error);
+      });
+    });
+  }
+
+  const res = await gotScraping(targetUrl, gotOptions);
+  const rawBody = res.rawBody !== undefined
+    ? res.rawBody
+    : Buffer.from(typeof res.body === "string" ? res.body : String(res.body ?? ""));
+  return new Response(rawBody, {
+    status: res.statusCode,
+    statusText: res.statusMessage || "",
+    headers: responseHeaders(res.headers),
+  });
+}
+
 // ─── TLS fingerprinting via got-scraping (browser-like JA3) ───────────────
 // Disabled: not in use. Kept commented for future re-enable.
 // Restore the original block to re-enable per-host JA3 spoofing.
@@ -309,6 +438,27 @@ export async function proxyAwareFetch(url, options = {}, proxyOptions = null) {
   const connectionProxyUrl = resolveConnectionProxyUrl(targetUrl, proxyOptions);
   const envProxyUrl = connectionProxyUrl ? null : normalizeProxyUrl(getEnvProxyUrl(targetUrl));
   const proxyUrl = connectionProxyUrl || envProxyUrl;
+
+  // Tabitoken's Cloudflare edge rejects native Node/Undici TLS fingerprints even
+  // when the same residential proxy and credentials work with a browser client.
+  // Keep this provider on the browser-like transport while preserving the proxy.
+  if (proxyUrl && isTabitokenTarget(targetUrl)) {
+    try {
+      return await gotScrapingFetch(targetUrl, options, proxyUrl);
+    } catch (error) {
+      // Never fall back to a direct request for this provider; keep the same proxy.
+      console.warn(`[ProxyFetch] Tabitoken browser transport failed: ${error.name || "Error"}`);
+      try {
+        const dispatcher = await getDispatcher(proxyUrl);
+        return await originalFetch(url, { ...options, dispatcher });
+      } catch (proxyError) {
+        if (proxyOptions?.strictProxy === true) {
+          throw new Error(`[ProxyFetch] Tabitoken proxy transport failed (strictProxy=true): ${proxyError.name || "Error"}`);
+        }
+        throw proxyError;
+      }
+    }
+  }
 
   // MITM DNS bypass: for known MITM-intercepted hosts, resolve real IP to avoid DNS spoof
   if (shouldBypassMitmDns(targetUrl)) {

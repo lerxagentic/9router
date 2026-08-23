@@ -35,6 +35,23 @@ describe("QODER_MODEL_MAP", () => {
     expect(QODER_MODEL_MAP.qmodel_latest).toBe("qmodel_latest");
   });
 
+  it("allows Qoder's cmodel (Cantus) fallback key", () => {
+    expect(QODER_MODEL_MAP.cmodel).toBe("cmodel");
+  });
+
+  it("exposes Qoder's cmodel in the static provider catalog", () => {
+    expect(PROVIDER_MODELS.qd.some((model) => model.id === "cmodel")).toBe(true);
+  });
+
+  it("uses the live Qwen3.8-Max key instead of the stale preview key", () => {
+    expect(PROVIDER_MODELS.qd.some((model) => model.id === "qmodel_38max")).toBe(true);
+    expect(PROVIDER_MODELS.qd.some((model) => model.id === "qmodel_preview")).toBe(false);
+  });
+
+  it("exposes Qoder's Lite model in the static provider catalog", () => {
+    expect(PROVIDER_MODELS.qd.some((model) => model.id === "lite")).toBe(true);
+  });
+
   it("exposes Qoder's latest model in the static provider catalog", () => {
     expect(PROVIDER_MODELS.qd.some((model) => model.id === "qmodel_latest")).toBe(true);
   });
@@ -523,6 +540,20 @@ describe("wrapQoderSSE", () => {
     const out = await drain(wrapped);
     expect(out).toContain("[qoder error 503");
     expect(out).toContain("data: [DONE]\n\n");
+  });
+
+  it("promotes a nested 10605 queue envelope to HTTP 403", async () => {
+    const nested = JSON.stringify({
+      code: "403",
+      message: JSON.stringify({
+        code: "10605",
+        message: JSON.stringify({ isQueued: true, modelKey: "cmodel", retryAfterSeconds: 30 }),
+      }),
+    });
+    const env = JSON.stringify({ statusCodeValue: 200, body: nested });
+    const wrapped = await wrapQoderSSE(makeResponse([`data: ${env}\n\n`]), "qoder/cmodel");
+    expect(wrapped.status).toBe(403);
+    expect(await wrapped.text()).toContain("10605");
   });
 
   it("non-ok responses are returned unchanged (no transform)", async () => {

@@ -283,9 +283,29 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
  */
 function isBillingBlock(inner) {
   if (!inner || typeof inner !== "string") return false;
-  const lowerMsg = inner.toLowerCase();
-  // Match: {"code":"112",...}, {"code":"10605",...}, or pricingUrl field
-  return /\"code\"\s*:\s*\"(112|10605)\"/.test(inner) || lowerMsg.includes("pricingurl");
+
+  const seen = new Set();
+  const inspect = (value, depth = 0) => {
+    if (depth > 6 || value == null) return false;
+    if (typeof value === "string") {
+      const lower = value.toLowerCase();
+      if (lower.includes("pricingurl")) return true;
+      if (seen.has(value)) return false;
+      seen.add(value);
+      try {
+        return inspect(JSON.parse(value), depth + 1);
+      } catch {
+        return /(?:^|[^0-9])(112|10605)(?:[^0-9]|$)/.test(value);
+      }
+    }
+    if (typeof value !== "object") return false;
+    if (String(value.code ?? "") === "112" || String(value.code ?? "") === "10605") return true;
+    return inspect(value.message, depth + 1)
+      || inspect(value.body, depth + 1)
+      || inspect(value.error, depth + 1);
+  };
+
+  return inspect(inner);
 }
 
 /**
@@ -316,8 +336,13 @@ async function peekFirstQoderFrame(reader, decoder) {
     const statusVal = typeof envelope.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
     const inner = typeof envelope.body === "string" ? envelope.body : "";
 
-    if (statusVal !== 200 && isBillingBlock(inner)) {
-      return { isBilling: true, statusVal, message: inner || `qoder billing block (${statusVal})` };
+    // Some Qoder queue/quota envelopes are wrapped in an outer
+    // statusCodeValue=200 even though the inner body is a 403/10605 error.
+    // Detect the inner billing/queue signature regardless of the outer value;
+    // otherwise the adapter emits HTTP 200 with an error string and the
+    // account/model fallback layer never gets a chance to run.
+    if (isBillingBlock(inner)) {
+      return { isBilling: true, statusVal: statusVal === 200 ? 403 : statusVal, message: inner || `qoder billing block (${statusVal})` };
     }
     return { isBilling: false, consumed };
   }

@@ -288,6 +288,19 @@ export async function saveRequestUsage(entry) {
         ]
       );
 
+      // Update API key usage counters (if API key is present)
+      if (entry.apiKey) {
+        const totalTokens = promptTokens + completionTokens;
+        db.run(`
+          UPDATE apiKeys
+          SET
+            tokensUsed = tokensUsed + ?,
+            requestsUsed = requestsUsed + 1,
+            updatedAt = ?
+          WHERE key = ? AND isActive = 1
+        `, [totalTokens, new Date().toISOString(), entry.apiKey]);
+      }
+
       const dateKey = getLocalDateKey(entry.timestamp);
       const row = db.get(`SELECT data FROM usageDaily WHERE dateKey = ?`, [dateKey]);
       const day = row ? parseJson(row.data, {}) : {

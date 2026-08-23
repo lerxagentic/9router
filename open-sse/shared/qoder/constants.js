@@ -62,6 +62,7 @@ export const QODER_MODEL_MAP = {
   gmodel: "gmodel",
   gfmodel: "gfmodel",
   kmodel: "kmodel",
+  cmodel: "cmodel",
   mmodel: "mmodel",
 };
 
