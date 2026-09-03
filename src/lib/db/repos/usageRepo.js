@@ -242,6 +242,9 @@ export async function saveRequestUsage(entry) {
   try {
     const db = await getAdapter();
 
+    // A caller-supplied timestamp identifies a retry; a generated timestamp
+    // does not, because concurrent requests can share the same millisecond.
+    const dedupe = Boolean(entry.timestamp);
     if (!entry.timestamp) entry.timestamp = new Date().toISOString();
     entry.cost = await calculateCost(entry.provider, entry.model, entry.tokens);
 
@@ -271,7 +274,7 @@ export async function saveRequestUsage(entry) {
         ]
       );
 
-      if (existing) {
+      if (dedupe && existing) {
         if (!existing.endpoint && entry.endpoint) {
           db.run(`UPDATE usageHistory SET endpoint = ? WHERE id = ?`, [entry.endpoint, existing.id]);
         }

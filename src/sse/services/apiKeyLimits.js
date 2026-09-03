@@ -97,9 +97,19 @@ function validateScope(record, model) {
     return { allowed: true };
   }
 
-  // Restricted scope - check allowed models/combos
-  const allowedModels = record.allowedModels ? JSON.parse(record.allowedModels) : [];
-  const allowedCombos = record.allowedCombos ? JSON.parse(record.allowedCombos) : [];
+  // Restricted scope - check allowed models/combos.
+  // Invalid persisted JSON must deny instead of crashing the request.
+  let allowedModels = [];
+  let allowedCombos = [];
+  try {
+    allowedModels = record.allowedModels ? JSON.parse(record.allowedModels) : [];
+    allowedCombos = record.allowedCombos ? JSON.parse(record.allowedCombos) : [];
+  } catch {
+    return { allowed: false, error: "API key scope configuration is invalid" };
+  }
+  if (!Array.isArray(allowedModels) || !Array.isArray(allowedCombos)) {
+    return { allowed: false, error: "API key scope configuration is invalid" };
+  }
 
   // Check if model is in allowed list
   const isAllowed = allowedModels.includes(model) || allowedCombos.includes(model);
